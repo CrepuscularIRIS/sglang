@@ -195,10 +195,7 @@ class SchedulerRuntimeCheckerMixin:
         for req in batch.reqs:
             assert req.kv_committed_freed == req.kv_overallocated_freed
             uncached_len = 0
-            # Skip requests whose KV has been freed or transferred to a
-            # streaming session (req_pool_idx set to None by SessionAwareCache).
-            # Session-transferred tokens are accounted for by session_held_tokens().
-            if not req.kv_committed_freed and req.req_pool_idx is not None:
+            if not req.kv_committed_freed:
                 allocated_len = req.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
@@ -228,7 +225,7 @@ class SchedulerRuntimeCheckerMixin:
         swa_uncached = 0
         for req in batch.reqs:
             assert req.kv_committed_freed == req.kv_overallocated_freed
-            if req.kv_committed_freed or req.req_pool_idx is None:
+            if req.kv_committed_freed:
                 continue
 
             allocated_len = req.kv_allocated_len
@@ -254,6 +251,10 @@ class SchedulerRuntimeCheckerMixin:
             warnings.warn(
                 "Runtime memory check (busy) is not supported when speculation topk > 1."
             )
+            return
+
+        # Session accounting during busy check is not yet supported.
+        if isinstance(self.tree_cache, SessionAwareCache):
             return
 
         if self.is_hybrid_swa:
@@ -310,12 +311,8 @@ class SchedulerRuntimeCheckerMixin:
             swa_evictable,
         ) = self._get_swa_token_info()
 
-        if self.tree_cache.is_tree_cache():
-            full_protected = self.tree_cache.full_protected_size()
-            swa_protected = self.tree_cache.swa_protected_size()
-        else:
-            full_protected = 0
-            swa_protected = 0
+        full_protected = self.tree_cache.full_protected_size()
+        swa_protected = self.tree_cache.swa_protected_size()
 
         full_uncached, swa_uncached = self._get_batch_swa_uncached_sizes(current_batch)
 
