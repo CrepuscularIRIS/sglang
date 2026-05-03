@@ -157,6 +157,26 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
+        # For GQA models on multi-SM GPUs the grouped stage-1 decode kernel grid is
+        # (batch, ceil(num_head / BLOCK_H), max_kv_splits). With the default
+        # max_kv_splits=8 and a typical GQA model (e.g. 32Q/8KV, BLOCK_H=4), a
+        # 108-SM A100 gets only 64 blocks for batch=1 — under one full wave.
+        # Auto-scale max_kv_splits to target at least one full GPU wave for batch=1
+        # when the user has not already overridden it via split_tile_size or
+        # deterministic mode.
+        if (
+            self.split_tile_size is None
+            and not self.enable_deterministic
+            and self.device_core_count > 0
+            and self.num_head != self.num_kv_head
+        ):
+            kv_group_num = self.num_head // self.num_kv_head
+            block_h = min(16, kv_group_num)
+            effective_head_blocks = triton.cdiv(self.num_head, block_h)
+            target_splits = triton.cdiv(self.device_core_count, effective_head_blocks)
+            auto_kv_splits = min(triton.next_power_of_2(target_splits), 64)
+            self.max_kv_splits = max(self.max_kv_splits, auto_kv_splits)
+
         # Check arguments
         assert not (
             model_runner.sliding_window_size is not None

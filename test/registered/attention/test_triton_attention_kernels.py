@@ -866,5 +866,88 @@ class TestTritonAttention(CustomTestCase):
             self.assertEqual(len(unified_seq), prefix_len + extend_len)
 
 
+class TestDecodeAttentionAutoKVSplits(CustomTestCase):
+    """Verify grouped decode attention correctness when max_kv_splits > 8.
+
+    The TritonAttnBackend auto-scales max_kv_splits for GQA models so that
+    enough GPU blocks are launched to saturate all SMs.  These tests check
+    that the kernel still produces correct outputs with 16 and 32 splits,
+    which are the values that the auto-scaling logic produces for typical
+    GQA models (e.g. 32Q/8KV) on A100-class GPUs.
+    """
+
+    def _test_grouped_decode_long_ctx(self, B, S, H_Q, H_KV, D, max_kv_splits):
+        dtype = torch.bfloat16
+        device = get_device()
+        sm_scale = 1.0 / (D**0.5)
+        total_tokens = B * S
+        num_kv_splits = torch.full(
+            (B,), max_kv_splits, dtype=torch.int32, device=device
+        )
+
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+        k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
+        v_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
+        o = torch.zeros(B, H_Q, D, dtype=dtype, device=device)
+
+        b_seq_len = torch.full((B,), S, device=device)
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len[:B], dim=0)
+        kv_indices = torch.arange(total_tokens, device=device)
+
+        attn_logits = torch.empty(
+            (B, H_Q, max_kv_splits, D), dtype=torch.float32, device=device
+        )
+        attn_lse = torch.empty(
+            (B, H_Q, max_kv_splits), dtype=torch.float32, device=device
+        )
+
+        decode_attention_fwd_grouped(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            1.0,
+        )
+
+        o_ref = decode_attention_fwd_torch(
+            q, k_buffer, v_buffer, kv_indptr, kv_indices, sm_scale
+        )
+
+        max_abs_err = (o.to(torch.float32) - o_ref).abs().max().item()
+        self.assertTrue(
+            torch.allclose(o.to(torch.float32), o_ref, atol=1e-2, rtol=1e-2),
+            msg=(
+                f"grouped decode mismatch with max_kv_splits={max_kv_splits}, "
+                f"B={B}, S={S}, H_Q={H_Q}, H_KV={H_KV}, D={D}: "
+                f"max_abs_err={max_abs_err:.4f}"
+            ),
+        )
+
+    def test_grouped_decode_with_scaled_kv_splits(self):
+        """GQA models on A100-class GPUs get max_kv_splits in range [16, 32].
+
+        Verify correctness for both values across a range of sequence lengths
+        to confirm the kernel handles more splits without numerical drift.
+        """
+        configs = [
+            # (B, S, H_Q, H_KV, D)
+            (1, 200, 32, 8, 128),  # Llama-3.1-8B-like, short context
+            (1, 2000, 32, 8, 128),  # Llama-3.1-8B-like, long context
+            (2, 500, 32, 8, 128),  # Small batch, medium context
+            (1, 2000, 64, 8, 128),  # Llama-3.1-70B-like
+        ]
+        for max_kv_splits in [16, 32]:
+            for B, S, H_Q, H_KV, D in configs:
+                self._test_grouped_decode_long_ctx(B, S, H_Q, H_KV, D, max_kv_splits)
+
+
 if __name__ == "__main__":
     unittest.main()
